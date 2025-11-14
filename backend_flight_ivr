@@ -1,0 +1,608 @@
+
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
+from typing import Dict, List
+import logging
+import uuid
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client
+import os
+from dotenv import load_dotenv
+from fastapi.responses import FileResponse
+from redis import Redis
+from openai import OpenAI
+from datetime import datetime
+import json
+
+# Load environment variables
+load_dotenv()
+
+# Initialize FastAPI app
+app = FastAPI(title="Indian Airlines IVR System")
+
+# Twilio configuration
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+19789694592")
+
+if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN]):
+    logging.warning("Twilio credentials not fully set in environment variables.")
+
+try:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+except:
+    logging.warning("Twilio client initialization failed")
+    twilio_client = None
+
+# Initialize Redis connection
+redis_client = Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    db=int(os.getenv("REDIS_DB", 0)),
+    decode_responses=True
+)
+
+# Initialize OpenAI
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+
+# Logging configuration
+logging.basicConfig(level=logging.INFO)
+
+# Voice configuration
+TTS_VOICE = "Polly.Aditi"  # Indian English voice
+TTS_LANGUAGE = "en-IN"
+
+# System prompt for AI assistant
+SYSTEM_PROMPT = """You are a helpful Indian Airlines voice assistant. Keep responses under 30 words for voice interaction.
+
+Your capabilities:
+1. Book flights (collect: destination, date, passenger name)
+2. Check booking status (collect: booking ID)
+3. Cancel bookings (collect: booking ID)
+
+Extract information from user's natural speech. If information is missing, ask for it.
+
+Respond in JSON format:
+{
+    "intent": "book_flight|check_booking|cancel_booking|greeting|unknown",
+    "message": "what to say to the user",
+    "collected_info": {
+        "destination": "city if mentioned",
+        "date": "date if mentioned",
+        "booking_id": "ID if mentioned",
+        "passenger_name": "name if mentioned"
+    },
+    "info_complete": true/false,
+    "next_step": "ask_destination|ask_date|ask_name|ask_booking_id|complete|clarify"
+}
+
+Be conversational and natural. Handle Indian city names correctly.
+"""
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def create_speech_gather(action: str, timeout: int = 10, language: str = "en-IN") -> Gather:
+    """Create a standardized speech Gather object."""
+    return Gather(
+        input="speech",
+        action=action,
+        method="POST",
+        speech_timeout="auto",
+        timeout=timeout,
+        language=language,
+        enhanced=True
+    )
+
+def store_call_session(call_sid: str, from_number: str):
+    """Store call session information in Redis."""
+    redis_client.hset(f"call_session:{call_sid}", "from_number", from_number)
+    redis_client.hset(f"call_session:{call_sid}", "status", "in-progress")
+    redis_client.hset(f"call_session:{call_sid}", "conversation_history", json.dumps([]))
+
+def get_conversation_history(call_sid: str) -> List[dict]:
+    """Get conversation history from Redis."""
+    history_json = redis_client.hget(f"call_session:{call_sid}", "conversation_history")
+    if history_json:
+        return json.loads(history_json)
+    return []
+
+def update_conversation_history(call_sid: str, role: str, content: str):
+    """Update conversation history in Redis."""
+    history = get_conversation_history(call_sid)
+    history.append({"role": role, "content": content})
+    redis_client.hset(f"call_session:{call_sid}", "conversation_history", json.dumps(history))
+
+def save_booking(call_sid: str, booking_data: dict) -> str:
+    """Save booking data to Redis and return booking ID."""
+    booking_id = f"AI{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    for key, value in booking_data.items():
+        redis_client.hset(f"booking:{booking_id}", key, value)
+    redis_client.hset(f"booking:{booking_id}", "booking_id", booking_id)
+    redis_client.hset(f"booking:{booking_id}", "created_at", datetime.now().isoformat())
+    return booking_id
+
+def get_ai_response(user_input: str, conversation_history: List[dict]) -> dict:
+    """Process user input through OpenAI to get intelligent response."""
+    if not openai_client.api_key:
+        return fallback_response(user_input)
+    
+    try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": user_input})
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=150
+        )
+        
+        ai_message = response.choices[0].message.content
+        
+        try:
+            return json.loads(ai_message)
+        except json.JSONDecodeError:
+            return {
+                "intent": "unknown",
+                "message": ai_message,
+                "collected_info": {},
+                "info_complete": False,
+                "next_step": "clarify"
+            }
+            
+    except Exception as e:
+        logging.error(f"OpenAI Error: {e}")
+        return fallback_response(user_input)
+
+def fallback_response(user_input: str) -> dict:
+    """Simple keyword-based fallback if OpenAI unavailable."""
+    text = user_input.lower()
+    
+    if any(word in text for word in ["book", "booking", "reserve", "flight"]):
+        return {
+            "intent": "book_flight",
+            "message": "I can help you book a flight. Where would you like to fly to?",
+            "collected_info": {},
+            "info_complete": False,
+            "next_step": "ask_destination"
+        }
+    elif any(word in text for word in ["check", "status", "lookup"]):
+        return {
+            "intent": "check_booking",
+            "message": "I can check your booking. What's your booking ID?",
+            "collected_info": {},
+            "info_complete": False,
+            "next_step": "ask_booking_id"
+        }
+    elif any(word in text for word in ["cancel", "delete"]):
+        return {
+            "intent": "cancel_booking",
+            "message": "I can help cancel your booking. What's your booking ID?",
+            "collected_info": {},
+            "info_complete": False,
+            "next_step": "ask_booking_id"
+        }
+    else:
+        return {
+            "intent": "unknown",
+            "message": "I can help you book a flight, check your booking, or cancel a reservation. What would you like?",
+            "collected_info": {},
+            "info_complete": False,
+            "next_step": "clarify"
+        }
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
+class FlightBooking(BaseModel):
+    booking_id: str
+    passenger_name: str
+    destination: str
+    date: str
+    created_at: str
+
+# ============================================================================
+# MAIN ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+def read_root():
+    """Health check endpoint."""
+    return {
+        "status": "Indian Airlines IVR system is running",
+        "platform": "Twilio",
+        "twilio_number": TWILIO_PHONE_NUMBER,
+        "openai_configured": bool(openai_client.api_key)
+    }
+
+@app.get("/health")
+def health():
+    """Health check for monitoring."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "openai_configured": bool(openai_client.api_key),
+        "twilio_number": TWILIO_PHONE_NUMBER
+    }
+
+# ============================================================================
+# TWILIO WEBHOOK ENDPOINTS - DIGIT-BASED MENU SYSTEM
+# ============================================================================
+
+@app.post("/twilio/incoming_call")
+async def handle_incoming_call(request: Request):
+    """Handle incoming calls from Twilio - Main Menu."""
+    logging.info("Incoming call received")
+
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    from_number = form_data.get("From")
+
+    if not call_sid or not from_number:
+        raise HTTPException(status_code=400, detail="Invalid Twilio request")
+
+    # Store call session in Redis
+    store_call_session(call_sid, from_number)
+
+    # Create TwiML response
+    response = VoiceResponse()
+    gather = Gather(num_digits=1, action="/twilio/gather", method="POST", timeout=10)
+    gather.say(
+        "Welcome to Indian Airlines. "
+        "Press 1 to book a flight. "
+        "Press 2 to check your booking status. "
+        "Press 3 to cancel a booking. "
+        "Press 4 to speak with an agent. "
+        "Press 5 to hear this menu again.",
+        voice=TTS_VOICE,
+        language=TTS_LANGUAGE
+    )
+    response.append(gather)
+    response.say("We did not receive any input. Thank you for calling. Goodbye.", voice=TTS_VOICE, language=TTS_LANGUAGE)
+    response.hangup()
+
+    return Response(content=str(response), media_type="application/xml")
+
+@app.post("/twilio/gather")
+async def handle_gather(request: Request):
+    """Handle user input from main menu."""
+    form_data = await request.form()
+    digits = form_data.get("Digits")
+    call_sid = form_data.get("CallSid")
+
+    if not call_sid or not digits:
+        raise HTTPException(status_code=400, detail="Invalid Twilio request")
+
+    logging.info(f"Menu selection: {digits} for call {call_sid}")
+
+    response = VoiceResponse()
+
+    if digits == "1":
+        # Book a flight - start conversational flow
+        redis_client.hset(f"call_session:{call_sid}", "intent", "book_flight")
+        gather = create_speech_gather("/twilio/conversational_gather", language=TTS_LANGUAGE)
+        gather.say(
+            "Great! I'll help you book a flight. "
+            "Please tell me your destination city.",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        response.append(gather)
+        response.say("I didn't catch that. Please try again.", voice=TTS_VOICE, language=TTS_LANGUAGE)
+        response.redirect("/twilio/gather", method="POST")
+        
+    elif digits == "2":
+        # Check booking status
+        redis_client.hset(f"call_session:{call_sid}", "intent", "check_booking")
+        gather = create_speech_gather("/twilio/conversational_gather", language=TTS_LANGUAGE)
+        gather.say(
+            "I can help you check your booking. "
+            "Please provide your booking ID.",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        response.append(gather)
+        response.say("I didn't catch that. Please try again.", voice=TTS_VOICE, language=TTS_LANGUAGE)
+        response.redirect("/twilio/gather", method="POST")
+        
+    elif digits == "3":
+        # Cancel booking
+        redis_client.hset(f"call_session:{call_sid}", "intent", "cancel_booking")
+        gather = create_speech_gather("/twilio/conversational_gather", language=TTS_LANGUAGE)
+        gather.say(
+            "I can help you cancel your booking. "
+            "Please provide your booking ID.",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        response.append(gather)
+        response.say("I didn't catch that. Please try again.", voice=TTS_VOICE, language=TTS_LANGUAGE)
+        response.redirect("/twilio/gather", method="POST")
+        
+    elif digits == "4":
+        # Transfer to agent
+        response.say(
+            "Please hold while I transfer you to one of our agents.",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        # In production, add Dial verb here to transfer to agent
+        response.say(
+            "All our agents are currently busy. Please call back later. Goodbye.",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        response.hangup()
+        
+    elif digits == "5":
+        # Repeat menu
+        response.redirect("/twilio/incoming_call", method="POST")
+        
+    else:
+        # Invalid input
+        response.say("Invalid input. Please try again.", voice=TTS_VOICE, language=TTS_LANGUAGE)
+        response.redirect("/twilio/incoming_call", method="POST")
+
+    return Response(content=str(response), media_type="application/xml")
+
+@app.post("/twilio/conversational_gather")
+async def handle_conversational_gather(request: Request):
+    """Process speech input using conversational AI."""
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    speech_result = form_data.get("SpeechResult", "")
+    confidence = form_data.get("Confidence", "0")
+    
+    logging.info(f"Speech input - CallSid: {call_sid}, Speech: '{speech_result}', Confidence: {confidence}")
+    
+    if not call_sid:
+        raise HTTPException(status_code=400, detail="Invalid Twilio request")
+    
+    response = VoiceResponse()
+    
+    # Handle empty input
+    if not speech_result:
+        response.say(
+            "I didn't catch that. Could you please repeat?",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        gather = create_speech_gather("/twilio/conversational_gather", language=TTS_LANGUAGE)
+        response.append(gather)
+        response.say("Returning to main menu.", voice=TTS_VOICE, language=TTS_LANGUAGE)
+        response.redirect("/twilio/incoming_call", method="POST")
+        return Response(content=str(response), media_type="application/xml")
+    
+    # Get conversation history and add user input
+    conversation_history = get_conversation_history(call_sid)
+    update_conversation_history(call_sid, "user", speech_result)
+    
+    # Get current intent
+    current_intent = redis_client.hget(f"call_session:{call_sid}", "intent")
+    
+    # Get AI response
+    ai_result = get_ai_response(speech_result, conversation_history)
+    
+    logging.info(f"AI Response: {ai_result}")
+    
+    # Update conversation history with AI response
+    update_conversation_history(call_sid, "assistant", ai_result["message"])
+    
+    # Store collected information
+    collected_info_key = f"call_session:{call_sid}:collected_info"
+    if ai_result.get("collected_info"):
+        for key, value in ai_result["collected_info"].items():
+            if value:
+                redis_client.hset(collected_info_key, key, value)
+    
+    # Check if we have all information needed
+    if ai_result.get("info_complete"):
+        # Get all collected info
+        collected_info = redis_client.hgetall(collected_info_key)
+        
+        if current_intent == "book_flight" or ai_result["intent"] == "book_flight":
+            # Complete booking
+            booking_id = save_booking(call_sid, collected_info)
+            response.say(
+                f"Perfect! Your flight to {collected_info.get('destination', 'your destination')} "
+                f"on {collected_info.get('date', 'your selected date')} has been booked. "
+                f"Your booking ID is {booking_id}. "
+                f"A confirmation will be sent to your phone. "
+                f"Thank you for choosing Indian Airlines!",
+                voice=TTS_VOICE,
+                language=TTS_LANGUAGE
+            )
+            response.hangup()
+            
+        elif current_intent == "check_booking" or ai_result["intent"] == "check_booking":
+            # Check booking status
+            booking_id = collected_info.get("booking_id")
+            booking_exists = redis_client.exists(f"booking:{booking_id}")
+            
+            if booking_exists:
+                booking_data = redis_client.hgetall(f"booking:{booking_id}")
+                response.say(
+                    f"Your booking {booking_id} is confirmed. "
+                    f"Destination: {booking_data.get('destination')}. "
+                    f"Date: {booking_data.get('date')}. "
+                    f"Passenger: {booking_data.get('passenger_name')}. "
+                    f"Have a great journey!",
+                    voice=TTS_VOICE,
+                    language=TTS_LANGUAGE
+                )
+            else:
+                response.say(
+                    f"I couldn't find booking {booking_id}. "
+                    f"Please check your booking ID and try again, or contact our support team.",
+                    voice=TTS_VOICE,
+                    language=TTS_LANGUAGE
+                )
+            response.hangup()
+            
+        elif current_intent == "cancel_booking" or ai_result["intent"] == "cancel_booking":
+            # Cancel booking
+            booking_id = collected_info.get("booking_id")
+            booking_exists = redis_client.exists(f"booking:{booking_id}")
+            
+            if booking_exists:
+                redis_client.delete(f"booking:{booking_id}")
+                response.say(
+                    f"Your booking {booking_id} has been successfully cancelled. "
+                    f"Refund will be processed within 5 to 7 business days. "
+                    f"We hope to serve you again soon.",
+                    voice=TTS_VOICE,
+                    language=TTS_LANGUAGE
+                )
+            else:
+                response.say(
+                    f"I couldn't find booking {booking_id}. "
+                    f"Please verify your booking ID.",
+                    voice=TTS_VOICE,
+                    language=TTS_LANGUAGE
+                )
+            response.hangup()
+    else:
+        # Continue conversation - need more info
+        response.say(ai_result["message"], voice=TTS_VOICE, language=TTS_LANGUAGE)
+        
+        gather = create_speech_gather("/twilio/conversational_gather", timeout=10, language=TTS_LANGUAGE)
+        response.append(gather)
+        
+        # Timeout handling
+        response.say(
+            "I didn't hear you. Returning to main menu.",
+            voice=TTS_VOICE,
+            language=TTS_LANGUAGE
+        )
+        response.redirect("/twilio/incoming_call", method="POST")
+    
+    return Response(content=str(response), media_type="application/xml")
+
+@app.post("/twilio/status")
+async def twilio_status_callback(request: Request):
+    """Handle call status updates from Twilio."""
+    data = await request.form()
+    call_sid = data.get("CallSid")
+    call_status = data.get("CallStatus")
+    
+    logging.info(f"Call {call_sid} status: {call_status}")
+    
+    # Clean up session when call ends
+    if call_status in ["completed", "failed", "busy", "no-answer"]:
+        redis_client.delete(f"call_session:{call_sid}")
+        redis_client.delete(f"call_session:{call_sid}:collected_info")
+        logging.info(f"Cleaned up session: {call_sid}")
+    
+    return {"status": "ok"}
+
+# ============================================================================
+# BOOKING MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/bookings")
+def list_bookings():
+    """List all bookings."""
+    booking_keys = redis_client.keys("booking:*")
+    bookings = []
+    for key in booking_keys:
+        booking_data = redis_client.hgetall(key)
+        bookings.append(booking_data)
+    return {"total_bookings": len(bookings), "bookings": bookings}
+
+@app.get("/booking/{booking_id}")
+def get_booking(booking_id: str):
+    """Get booking details by ID."""
+    if not redis_client.exists(f"booking:{booking_id}"):
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    booking_data = redis_client.hgetall(f"booking:{booking_id}")
+    return booking_data
+
+@app.delete("/booking/{booking_id}")
+def cancel_booking(booking_id: str):
+    """Cancel a booking by ID."""
+    if not redis_client.exists(f"booking:{booking_id}"):
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    redis_client.delete(f"booking:{booking_id}")
+    return {"message": f"Booking {booking_id} cancelled successfully"}
+
+# ============================================================================
+# DEBUGGING & TESTING ENDPOINTS
+# ============================================================================
+
+@app.get("/test-ai")
+def test_ai():
+    """Test if OpenAI is configured and working."""
+    if not openai_client.api_key:
+        return {
+            "status": "error",
+            "message": "OpenAI API key not configured",
+            "solution": "Add OPENAI_API_KEY to your .env file"
+        }
+    
+    try:
+        test_response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": "Say 'API working'"}],
+            max_tokens=10
+        )
+        return {
+            "status": "ok",
+            "message": "OpenAI API is working!",
+            "response": test_response.choices[0].message.content
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/sessions")
+def list_sessions():
+    """List all active call sessions."""
+    session_keys = redis_client.keys("call_session:*")
+    sessions = []
+    for key in session_keys:
+        if ":collected_info" not in key:
+            session_data = redis_client.hgetall(key)
+            sessions.append({"call_sid": key.replace("call_session:", ""), **session_data})
+    return {"active_sessions": len(sessions), "sessions": sessions}
+
+# ============================================================================
+# EXCEPTION HANDLER
+# ============================================================================
+
+@app.exception_handler(Exception)
+def handle_exceptions(request: Request, exc: Exception):
+    """Log and handle exceptions."""
+    logging.error(f"Error occurred: {exc}")
+    return Response(content="Internal server error", status_code=500)
+
+# ============================================================================
+# FAVICON
+# ============================================================================
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Serve the favicon.ico file."""
+    try:
+        return FileResponse("static/favicon.ico")
+    except:
+        return Response(content="", status_code=204)
+
+# ============================================================================
+# RUN INSTRUCTIONS
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Indian Airlines IVR System")
+    print(f"📞 Twilio Number: {TWILIO_PHONE_NUMBER}")
+    print(f"🤖 OpenAI Configured: {bool(openai_client.api_key)}")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
