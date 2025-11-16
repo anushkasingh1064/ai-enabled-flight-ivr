@@ -1,5 +1,4 @@
 
-pip install --upgrade pip
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -617,3 +616,4 @@ if __name__ == "__main__":
     print(f"🤖 OpenAI Configured: {bool(openai_client.api_key)}")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
